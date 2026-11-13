@@ -1,0 +1,8 @@
+把你自己准备的截图放进这个 images/ 文件夹，文件名对应 README「图片展示」一节里的占位即可自动生效：
+
+- preview-load.png          加载图像 / 扩图面板
+- preview-workbench.png     工作台面板
+- preview-storyboard.png    分镜多图出图
+- preview-optimizer.png     提示词优化
+
+（文件名可随意改，只要和 README 里的引用路径一致即可。）
