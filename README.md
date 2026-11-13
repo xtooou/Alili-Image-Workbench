@@ -132,6 +132,11 @@ VAELoader ───────────────────────�
 | ![加载图像](images/preview-load.png) | ![工作台](images/preview-workbench.png) |
 | 9 张参考图 | 提示词 / 比例 / 分镜 |
 
+| 保存图像 | 总览 |
+| :---: | :---: |
+| ![保存图像](images/preview-storyboard.png) | ![总览](images/preview-optimizer.png) |
+| 9 张参考图 | 提示词 / 比例 / 分镜 |
+
 ---
 
 ## 📺 B站视频教程
