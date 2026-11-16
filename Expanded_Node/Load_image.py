@@ -1,11 +1,14 @@
 """Alili 加载图像节点
 
-只负责维护参考图列表（最多 9 张，顺序即 <imageN> 的 N），原样打包成 ALILI_IMAGES。
-不做遮罩、不做扩图、不缩放、不生成。
+维护参考图列表（最多 9 张，顺序即 <imageN> 的 N），打包成 ALILI_IMAGES。
+不做遮罩、不做扩图、不生成。唯一的图像处理是「可选的参考图缩放」：
+开关关闭时张量原样透传（与旧版一致）；开启时在内存里按总像素等比缩放，
+不写任何文件、不覆盖 input 目录里的原图，三家编辑模型统一拿到缩放后的张量。
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 
 import folder_paths
@@ -69,6 +72,67 @@ def _parse_state(text):
     return state if isinstance(state, dict) else {}
 
 
+# ==============================================================================
+# 可选的参考图缩放：内存张量，不落盘
+# 配置存在 state["resize"] = {enabled, megapixels, include_first}
+# ==============================================================================
+
+RESIZE_METHOD = "area"          # 与 H3 官流一致；area 对缩小最稳，留常量以后可开放
+RESIZE_MIN_MP = 0.1
+RESIZE_MAX_MP = 16.0
+RESIZE_DEFAULT_MP = 1.0
+RESIZE_ALIGN = 8                # VAE 要求 8 的倍数；内部对齐，不暴露为参数
+
+
+def _resize_config(state):
+    """解析缩放配置；缺省 = 关闭，老工作流行为不变。"""
+    cfg = state.get("resize")
+    if not isinstance(cfg, dict):
+        return {"enabled": False, "megapixels": RESIZE_DEFAULT_MP, "include_first": True}
+    try:
+        enabled = bool(cfg.get("enabled", False))
+    except (TypeError, ValueError):
+        enabled = False
+    try:
+        mp = float(cfg.get("megapixels", RESIZE_DEFAULT_MP))
+    except (TypeError, ValueError):
+        mp = RESIZE_DEFAULT_MP
+    mp = min(RESIZE_MAX_MP, max(RESIZE_MIN_MP, mp))
+    try:
+        include_first = bool(cfg.get("include_first", True))
+    except (TypeError, ValueError):
+        include_first = True
+    return {"enabled": enabled, "megapixels": mp, "include_first": include_first}
+
+
+def _target_size(width, height, megapixels):
+    """按总像素 + 原比例算目标宽高，按 8 倍数取整（内部约束，不做倍数参数）。"""
+    ratio = width / float(height)
+    total = max(RESIZE_MIN_MP, float(megapixels)) * 1024 * 1024
+    new_w = math.sqrt(total * ratio)
+    new_h = math.sqrt(total / ratio)
+    new_w = max(RESIZE_ALIGN, int(round(new_w / RESIZE_ALIGN)) * RESIZE_ALIGN)
+    new_h = max(RESIZE_ALIGN, int(round(new_h / RESIZE_ALIGN)) * RESIZE_ALIGN)
+    return new_w, new_h
+
+
+def _resize_tensor(image, megapixels):
+    """在内存里缩放一张 [1,H,W,C] 的 float 张量，返回同结构张量。
+
+    用 PIL 的 BOX/area 算法（缩小质量与 ComfyUI 的 area 一致），不写文件。
+    """
+    _, h, w, c = image.shape
+    new_w, new_h = _target_size(w, h, megapixels)
+    if new_w == w and new_h == h:
+        return image
+    arr = (image[0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    pil = Image.fromarray(arr, mode="RGB" if c == 3 else "RGBA")
+    box = getattr(getattr(Image, "Resampling", Image), "BOX", Image.BILINEAR)
+    pil = pil.resize((new_w, new_h), box)
+    out = np.asarray(pil, dtype=np.float32) / 255.0
+    return torch.from_numpy(out[None,])
+
+
 class AliliLoadImage(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -76,7 +140,7 @@ class AliliLoadImage(io.ComfyNode):
             node_id="AliliLoadImage",
             display_name="Alili 加载图像",
             category=NODE_CATEGORY,
-            description="加载最多 9 张参考图，原样打包 ALILI_IMAGES 交给工作台 / Alili 文本编码。",
+            description="加载最多 9 张参考图打包 ALILI_IMAGES；可选按总像素内存缩放（不改原图），交给工作台 / Alili 文本编码。",
             inputs=[
                 io.String.Input("alili_state_json", default="", optional=True, extra_dict={"hidden": True}),
             ],
@@ -93,6 +157,18 @@ class AliliLoadImage(io.ComfyNode):
             if isinstance(name, str) and name:
                 names.append(name)
         images = [_load_image(name) for name in names]
+
+        # 可选缩放：只在内存里做，原图文件一个字节都不动。
+        # include_first=False 时第 1 张（主体参考）保持原样，其余按总像素等比缩放。
+        cfg = _resize_config(state)
+        if cfg["enabled"]:
+            scaled = []
+            for index, image in enumerate(images):
+                if index == 0 and not cfg["include_first"]:
+                    scaled.append(image)
+                else:
+                    scaled.append(_resize_tensor(image, cfg["megapixels"]))
+            images = scaled
 
         return io.NodeOutput({
             "images": images,
