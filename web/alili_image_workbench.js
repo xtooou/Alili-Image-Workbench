@@ -10,8 +10,10 @@ const DEFAULT_SIZE = [500, 540];   // 仅新建节点时的默认宽高，之后
 
 const LOAD_NODE = "AliliLoadImage";  // 参考图来自这个节点
 
-// 模板下拉清单：默认项固定，其余由后端扫描 templates/t2i/*.md、templates/i2i/*.md 动态填入
-const TEMPLATE_DEFAULT = "自由发挥 (默认)";
+// 模板下拉清单：默认项固定，其余由后端扫描 prompt/ 目录动态填入
+//   左「生图」→ prompt/fixed_prompt/*.md（成品提示词，不走 API，直接送文本编码）
+//   右「编辑」→ prompt/api_prompt/*.md（给大模型看的改写指令，走 API）
+const TEMPLATE_DEFAULT = "手动输入";
 const T2I_TEMPLATES = [TEMPLATE_DEFAULT];
 const I2I_TEMPLATES = [TEMPLATE_DEFAULT];
 
@@ -39,6 +41,21 @@ async function fetchTemplateLists() {
     const res = await api.fetchApi(`${OPTIMIZER_ROUTE}/templates`);
     if (!res.ok) throw new Error(`模板列表读取失败 (${res.status})`);
     return res.json();
+}
+
+// 成品提示词清单（prompt/fixed_prompt/*.md）：选中即内部生效，不走 API、不写编辑器
+async function fetchFixedPrompts() {
+    const res = await api.fetchApi(`${OPTIMIZER_ROUTE}/fixed`);
+    if (!res.ok) throw new Error(`成品提示词读取失败 (${res.status})`);
+    return res.json();
+}
+
+// 统一清单：kind = fixed / api / look
+async function fetchPromptNames(kind) {
+    const res = await api.fetchApi(`${OPTIMIZER_ROUTE}/list?` + new URLSearchParams({ kind }));
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => ({}));
+    return Array.isArray(data.items) ? data.items : [];
 }
 
 // ---- 分镜出图 ----
@@ -246,6 +263,12 @@ function make(tag, css = {}, text = "") {
 }
 function fileUrl(name) {
     if (!name || name === "(none)") return "";
+    // 素材库可能落在任意可配置目录（models/Alili_Library 等）：绝对路径必须走素材路由，
+    // 否则 /view 找不到文件 → 提示词芯片破图、API 优化读图直接抛 "Image read error"。
+    if (/^[a-zA-Z]:[\\/]/.test(name) || name.startsWith("/")) {
+        const path = `/alili/asset/file?path=${encodeURIComponent(name)}`;
+        return typeof api.apiURL === "function" ? api.apiURL(path) : path;
+    }
     const parts = String(name).replaceAll("\\", "/").split("/").filter(Boolean);
     const filename = parts.pop() || "";
     const params = new URLSearchParams({ filename, type: "input", subfolder: parts.join("/") });
@@ -301,7 +324,7 @@ function drawSlotResolutionOverlay(node, ctx) {
 
     const width = Number(node.size?.[0]) || DEFAULT_SIZE[0];
     ctx.save();
-    ctx.fillStyle = "#0db5e8";
+    ctx.fillStyle = "#8ab4f8";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.font = "bold 12px Arial,sans-serif";
@@ -319,12 +342,131 @@ function forwardWheelToCanvas(el, keepNative) {
     }, { passive: false });
 }
 
+// 原生 <select> 的弹层是浏览器自己画的：尖角、字号不跟画布缩放、还会被节点边界裁掉。
+// 这里换成自绘下拉：select 只留 value 和 change 事件，显示层和列表都用 DOM，跟节点一起缩放。
+function enhanceTemplateSelect(wrap, select) {
+    select.classList.add("ghh3-select-hidden");
+    const display = make("div");
+    display.className = "ghh3-template-select ghh3-select-display";
+    const label = make("span");
+    label.className = "ghh3-select-label";
+    display.appendChild(label);
+    const menu = make("div");
+    menu.className = "ghh3-select-menu";
+    menu.style.display = "none";
+
+    let opened = false;
+    let onDoc = null;
+    const close = () => {
+        opened = false;
+        menu.style.display = "none";
+        display.classList.remove("open");
+        if (onDoc) document.removeEventListener("pointerdown", onDoc, true);
+    };
+    const sync = () => {
+        label.textContent = select.value;
+        label.title = select.value;
+    };
+    const build = () => {
+        menu.textContent = "";
+        [...select.options].forEach(option => {
+            const item = make("div", {}, option.textContent);
+            item.className = "ghh3-select-item" + (option.value === select.value ? " active" : "");
+            item.onclick = event => {
+                event.stopPropagation();
+                if (select.value !== option.value) {
+                    select.value = option.value;
+                    select.dispatchEvent(new Event("change"));
+                }
+                close();
+                sync();
+            };
+            menu.appendChild(item);
+        });
+    };
+    display.onclick = event => {
+        event.stopPropagation();
+        if (opened) { close(); return; }
+        build();
+        opened = true;
+        menu.style.display = "block";
+        display.classList.add("open");
+        onDoc = e => { if (!wrap.contains(e.target)) close(); };
+        document.addEventListener("pointerdown", onDoc, true);
+    };
+    wrap.append(display, menu);
+    sync();
+    return { display, menu, sync };
+}
+
+// 弹窗里的原生下拉弹层同样是浏览器画的（尖角 + 系统配色 + 系统字号），CSS 改不到。
+// 包成自绘：select 只留 value 和 change，显示层 / 列表都用 DOM，圆角跟输入框一致。
+function enhanceOptSelect(select) {
+    const host = select.parentElement;
+    const wrap = make("div");
+    wrap.className = "ghh3-sel-wrap";
+    host.insertBefore(wrap, select);
+    wrap.appendChild(select);
+    // 内联兜底：样式表万一没注入，也不能让原生 select 露出来抢点击
+    Object.assign(select.style, { position: "absolute", inset: "0", width: "100%", height: "100%", opacity: "0", pointerEvents: "none" });
+    const display = make("div");
+    display.className = "ghh3-sel-display";
+    const label = make("span");
+    display.appendChild(label);
+    const panel = make("div");
+    panel.className = "ghh3-sel-panel";
+    panel.style.display = "none";
+
+    let onDoc = null;
+    const sync = () => {
+        const opt = select.selectedOptions[0];
+        label.textContent = opt ? opt.textContent : "";
+    };
+    const close = () => {
+        panel.style.display = "none";
+        display.classList.remove("open");
+        if (onDoc) { document.removeEventListener("pointerdown", onDoc, true); onDoc = null; }
+    };
+    const build = () => {
+        panel.textContent = "";
+        [...select.options].forEach(option => {
+            const item = make("div", {}, option.textContent);
+            item.className = "ghh3-sel-item" + (option.value === select.value ? " active" : "");
+            item.onclick = ev => {
+                ev.stopPropagation();
+                if (select.value !== option.value) {
+                    select.value = option.value;
+                    select.dispatchEvent(new Event("change"));
+                }
+                close();
+                sync();
+            };
+            panel.appendChild(item);
+        });
+    };
+    display.onclick = ev => {
+        ev.stopPropagation();
+        if (panel.style.display === "block") { close(); return; }
+        build();
+        panel.style.display = "block";
+        display.classList.add("open");
+        onDoc = e => { if (!wrap.contains(e.target)) close(); };
+        document.addEventListener("pointerdown", onDoc, true);
+    };
+    // 类型切换时「选择文件」列表会整体重建，需要跟着刷新显示文字
+    new MutationObserver(sync).observe(select, { childList: true });
+    select.addEventListener("change", () => setTimeout(sync, 0));
+    wrap.append(display, panel);
+    sync();
+    return { display, panel, sync };
+}
+
 function createPanel(node) {
     if (typeof node.addDOMWidget !== "function") return false;
 
     const root = make("div", {
         position: "relative", width: "100%",
-        boxSizing: "border-box", color: "#d7e3ef", fontFamily: "Arial,sans-serif",
+        boxSizing: "border-box", color: "#e3e3e3", fontFamily: "Arial,sans-serif",
         fontSize: "12px", userSelect: "none", padding: "1px 0 2px", overflow: "visible",
     });
     Object.assign(root.style, {
@@ -340,49 +482,91 @@ function createPanel(node) {
     style.textContent = `
       .ghh3-modes{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:2px 0 6px}
       .ghh3-template-wrapper{position:relative;display:flex;align-items:center;width:100%}
-      .ghh3-template-badge{position:absolute;left:6px;z-index:2;pointer-events:none;padding:1px 6px;font-size:10px;line-height:16px;border-radius:999px;background:#1a2836;color:#8ba2b5;border:1px solid #2d4559;white-space:nowrap;font-weight:500;transition:all .15s}
-      .ghh3-template-wrapper.active .ghh3-template-badge{background:rgba(8,180,237,.18);color:#08b4ed;border-color:rgba(8,180,237,.45);font-weight:600}
-      .ghh3-template-select{height:30px;border:1px solid #2d4255;border-radius:6px;background:#14202c;color:#d9e5ef;font-size:12px;padding:0 22px 0 46px;cursor:pointer;outline:none;width:100%;box-sizing:border-box;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238697a7' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;transition:border-color .15s,color .15s}
-      .ghh3-template-select:hover{border-color:#3a5c76}
-      .ghh3-template-select.active{border-color:#0aa4d6;color:#08b4ed;font-weight:600}
-      .ghh3-prompt{display:block;width:100%;height:100%;min-height:0;resize:none;overflow:auto;box-sizing:border-box;border:0;border-radius:6px;background:#1d2731;color:#e1e9ef;padding:7px 7px calc(7px + 14 * 1.4em);font:12px/1.4 Arial,sans-serif;outline:none;user-select:text;scrollbar-width:thin;scrollbar-color:#1f3540 transparent}
-      .ghh3-prompt::placeholder{color:#52616d;opacity:1}
+      .ghh3-template-badge{position:absolute;left:6px;z-index:2;pointer-events:none;padding:1px 6px;font-size:10px;line-height:16px;border-radius:999px;background:#33363b;color:#9aa0a6;border:1px solid rgba(255,255,255,.12);white-space:nowrap;font-weight:500;transition:all .15s}
+      .ghh3-template-wrapper.active .ghh3-template-badge{background:rgba(138,180,248,.18);color:#8ab4f8;border-color:rgba(138,180,248,.45);font-weight:600}
+      .ghh3-template-select{height:30px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#2a2c30;color:#e3e3e3;font-size:12px;padding:0 22px 0 46px;cursor:pointer;outline:none;width:100%;box-sizing:border-box;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238697a7' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;transition:border-color .15s,color .15s}
+      .ghh3-template-select:hover{border-color:rgba(255,255,255,.24)}
+      .ghh3-template-select.active{border-color:#8ab4f8;color:#8ab4f8;font-weight:600}
+      /* 自绘下拉：select 本身隐藏，显示层与列表跟着节点缩放，圆角和字号自己控制 */
+      .ghh3-select-hidden{opacity:0;pointer-events:none}
+      .ghh3-select-display{position:absolute;inset:0;display:flex;align-items:center;box-sizing:border-box;cursor:pointer;padding:0 26px 0 46px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#2a2c30;color:#e3e3e3;font-size:12px;overflow:hidden;transition:border-color .15s,color .15s}
+      .ghh3-select-display:hover{border-color:rgba(255,255,255,.24)}
+      .ghh3-select-display.active{border-color:#8ab4f8;color:#8ab4f8;font-weight:600}
+      .ghh3-select-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:30px}
+      .ghh3-select-display::after{content:"";position:absolute;right:10px;top:50%;width:7px;height:7px;margin-top:-5px;border-right:1.5px solid #9aa0a6;border-bottom:1.5px solid #9aa0a6;transform:rotate(45deg);transition:transform .15s}
+      .ghh3-select-display.open::after{transform:rotate(-135deg);margin-top:-2px}
+      .ghh3-select-menu{position:absolute;left:0;right:0;top:calc(100% + 3px);z-index:40;max-height:216px;overflow-y:auto;box-sizing:border-box;padding:4px;background:#1e1f22;border:1px solid rgba(255,255,255,.12);border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.55)}
+      .ghh3-select-menu::-webkit-scrollbar{width:6px}
+      .ghh3-select-menu::-webkit-scrollbar-thumb{background:#33363b;border-radius:3px}
+      .ghh3-select-item{padding:6px 9px 6px 46px;border-radius:5px;font-size:12px;line-height:1.5;color:#e3e3e3;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .ghh3-select-item:hover{background:#33363b}
+      .ghh3-select-item.active{background:#8ab4f8;color:#0b1620;font-weight:600}
+      .ghh3-prompt{display:block;width:100%;height:100%;min-height:0;resize:none;overflow:auto;box-sizing:border-box;border:0;border-radius:6px;background:transparent;color:#e3e3e3;padding:7px 7px calc(7px + 14 * 1.4em);font:12px/1.4 Arial,sans-serif;outline:none;user-select:text;scrollbar-width:thin;scrollbar-color:#33363b transparent}
+      .ghh3-prompt::placeholder{color:#6b7076;opacity:1}
       .ghh3-prompt::-webkit-scrollbar{width:5px}
       .ghh3-prompt::-webkit-scrollbar-track{background:transparent}
-      .ghh3-prompt::-webkit-scrollbar-thumb{background:#1f3540;border-radius:3px}
-      .ghh3-prompt::-webkit-scrollbar-thumb:hover{background:#294955}
-      .ghh3-prompt-wrap{position:relative;display:grid;grid-template-rows:22px minmax(0,1fr);width:100%;height:100%;min-height:0;background:#1d2731;border-radius:6px;overflow:hidden}
+      .ghh3-prompt::-webkit-scrollbar-thumb{background:#33363b;border-radius:3px}
+      .ghh3-prompt::-webkit-scrollbar-thumb:hover{background:#3d4046}
+      .ghh3-prompt-wrap{position:relative;display:grid;grid-template-rows:22px minmax(0,1fr);width:100%;height:100%;min-height:0;background:#232428;border-radius:8px;overflow:hidden}
       .ghh3-prompt-wrap .ghh3-prompt{grid-row:2;border-radius:0 0 6px 6px}
-      .ghh3-prompt-tools{grid-row:1;display:flex;align-items:center;justify-content:flex-start;gap:5px;padding:2px 6px;box-sizing:border-box;background:#1d2731;z-index:4}
-      .ghh3-prompt-elapsed{display:none;color:#8fa3b3;font:11px/18px Arial,sans-serif;white-space:nowrap}
+      .ghh3-prompt-tools{grid-row:1;display:flex;align-items:center;justify-content:flex-start;gap:5px;padding:2px 6px;box-sizing:border-box;background:transparent;border-bottom:1px solid rgba(255,255,255,.12);z-index:4}
+      .ghh3-prompt-elapsed{display:none;color:#9aa0a6;font:11px/18px Arial,sans-serif;white-space:nowrap}
       .ghh3-prompt-elapsed.visible{display:inline-block}
-      .ghh3-prompt-tool{height:18px;min-width:18px;padding:0 9px;box-sizing:border-box;border:0;border-radius:9px;background:#2a3a49;color:#b4c4d1;font:bold 12px/18px Arial,sans-serif;cursor:pointer;flex:0 0 auto}
-      .ghh3-prompt-tool:hover{color:#fff;background:#355068}
+      .ghh3-prompt-tool{height:18px;min-width:18px;padding:0 9px;box-sizing:border-box;border:0;border-radius:9px;background:transparent;color:#c9ccd1;font:bold 12px/18px Arial,sans-serif;cursor:pointer;flex:0 0 auto}
+      .ghh3-prompt-tool:hover{color:#e3e3e3;background:#33363b}
       .ghh3-prompt-tool:disabled{opacity:.3;cursor:not-allowed}
       .ghh3-prompt-tool.icon{padding:0 8px;font-size:15px}
       .ghh3-pushright{margin-left:auto}
-      .ghh3-shot-toggle.active{color:#fff;background:#0a86b0}
-      .ghh3-prompt-loading{color:#fff!important;background:#0a86b0!important;animation:ghh3-pulse 1.1s ease-in-out infinite}
+      .ghh3-shot-toggle.active{color:#0b1620;background:#8ab4f8;font-weight:700}
+      .ghh3-prompt-loading{color:#0b1620!important;background:#8ab4f8!important;animation:ghh3-pulse 1.1s ease-in-out infinite}
       @keyframes ghh3-pulse{50%{opacity:.45}}
-      .ghh3-tpl-text{display:block;width:100%;height:280px;box-sizing:border-box;margin-top:8px;background:#1d2b36;color:#dce7ee;border:1px solid #3a4d5b;border-radius:4px;padding:8px;font:12px/1.5 Consolas,monospace;resize:vertical;outline:none}
-      .ghh3-tpl-status{min-height:16px;margin-top:6px;font-size:12px;color:#8ba2b5}
-      .ghh3-tool-tip{position:fixed;z-index:10100;padding:4px 7px;border-radius:4px;background:#111a22;color:#cbd7df;border:1px solid #344753;font:10px/1.2 Arial,sans-serif;pointer-events:none;white-space:nowrap}
+      .ghh3-tpl-text{display:block;width:100%;height:300px;box-sizing:border-box;margin-top:0;background:#2a2c30;color:#e3e3e3;border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:12px;font:15px/1.75 Consolas,monospace;resize:vertical;outline:none}
+      .ghh3-tpl-status{margin-top:6px;font-size:13px;color:#9aa0a6}
+      .ghh3-tpl-status:empty{display:none}
+      .ghh3-tool-tip{position:fixed;z-index:10100;padding:4px 7px;border-radius:4px;background:#2a2c30;color:#c9ccd1;border:1px solid rgba(255,255,255,.12);font:10px/1.2 Arial,sans-serif;pointer-events:none;white-space:nowrap}
       .ghh3-prompt-wrap{grid-template-columns:minmax(0,1fr)}
-      .ghh3-prompt-wrap .ghh3-prompt-rich{position:absolute;grid-row:auto;left:0;right:0;top:22px;bottom:0;width:100%;height:auto;min-height:0;max-height:none;z-index:2;overflow-x:hidden;overflow-y:auto;background:#1d2731;color:#e1e9ef;-webkit-text-fill-color:currentColor;caret-color:#e1e9ef;line-height:2.35;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;padding:7px 7px calc(7px + 14 * 1.4em)}
-      .ghh3-prompt-rich.ghh3-prompt-empty:before{content:attr(data-placeholder);position:absolute;left:7px;right:7px;top:7px;color:#52616d;white-space:pre-wrap;pointer-events:none}
-      .ghh3-prompt-tag{display:inline-block;box-sizing:border-box;padding:1px 5px;margin:0 2px;border-radius:5px;background:#3b3b3b;color:#cdcdcd;-webkit-text-fill-color:#cdcdcd;font-size:.86em;line-height:1.35;vertical-align:middle;white-space:nowrap}
-      .ghh3-prompt-tag-image{background:#31515a}
+      .ghh3-prompt-wrap .ghh3-prompt-rich{position:absolute;grid-row:auto;left:0;right:0;top:22px;bottom:0;width:100%;height:auto;min-height:0;max-height:none;z-index:2;overflow-x:hidden;overflow-y:auto;background:transparent;color:#e3e3e3;-webkit-text-fill-color:currentColor;caret-color:#e3e3e3;line-height:2.35;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;padding:7px 7px calc(7px + 14 * 1.4em)}
+      .ghh3-prompt-rich.ghh3-prompt-empty:before{content:attr(data-placeholder);position:absolute;left:7px;right:7px;top:7px;color:#6b7076;white-space:pre-wrap;pointer-events:none}
+      .ghh3-prompt-tag{display:inline-block;box-sizing:border-box;padding:1px 5px;margin:0 2px;border-radius:5px;background:#3a3d42;color:#c9ccd1;-webkit-text-fill-color:#c9ccd1;font-size:.86em;line-height:1.35;vertical-align:middle;white-space:nowrap}
+      .ghh3-prompt-tag-image{background:#35404a}
       .ghh3-prompt-media-token{display:inline-flex;align-items:center;vertical-align:middle;white-space:nowrap}
-      .ghh3-prompt-media-preview{position:static;flex:0 0 26px;width:26px;height:26px;margin-left:.5em;margin-right:4px;box-sizing:border-box;border:1px solid rgba(91,124,143,.72);border-radius:5px;background:#14222d;object-fit:cover;display:inline-flex;overflow:hidden;vertical-align:middle;user-select:none}
-      .ghh3-opt-overlay{position:fixed;inset:0;z-index:10050;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.58);font:12px Arial,sans-serif}
-      .ghh3-opt-dialog{width:min(470px,calc(100vw - 30px));background:#17222c;color:#d7e3ec;border:1px solid #344958;border-radius:9px;box-shadow:0 18px 50px rgba(0,0,0,.5);padding:14px}
-      .ghh3-opt-title{font-size:12px;margin-bottom:12px;white-space:nowrap}
-      .ghh3-opt-row{display:grid;grid-template-columns:140px minmax(0,1fr);align-items:center;gap:8px;min-height:38px;margin:0}
-      .ghh3-opt-row>span{white-space:nowrap}
-      .ghh3-opt-row input,.ghh3-opt-row select{width:100%;box-sizing:border-box;background:#1d2b36;color:#dce7ee;border:1px solid #3a4d5b;border-radius:4px;padding:6px;font:inherit}
-      .ghh3-opt-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:28px}
-      .ghh3-opt-actions button{border:1px solid #3a4d5b;border-radius:4px;background:#1d2b36;color:#cbd8e0;padding:5px 12px;cursor:pointer}
-      .ghh3-opt-actions button:last-child{background:#17535a;border-color:#26717a;color:#e0f2f2}
+      .ghh3-prompt-media-preview{position:static;flex:0 0 26px;width:26px;height:26px;margin-left:.5em;margin-right:4px;box-sizing:border-box;border:1px solid rgba(255,255,255,.18);border-radius:5px;background:#2a2c30;object-fit:cover;display:inline-flex;overflow:hidden;vertical-align:middle;user-select:none}
+      /* 与「存为素材」弹窗(.als-dialog)同一套排版：17/19/16 留白、42px 控件、13px 标签、18px 按钮 */
+      .ghh3-opt-overlay{position:fixed;inset:0;z-index:10050;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.58);font:13px/1.6 Arial,sans-serif}
+      .ghh3-opt-dialog{width:min(520px,calc(100vw - 32px));box-sizing:border-box;background:#1e1f22;color:#e3e3e3;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 18px 48px rgba(0,0,0,.55);padding:17px 19px 16px}
+      .ghh3-opt-title{font-size:15px;font-weight:600;margin:0 0 13px;white-space:nowrap}
+      .ghh3-opt-row{display:grid;grid-template-columns:88px minmax(0,1fr);align-items:center;gap:10px;min-height:42px;margin:0 0 14px}
+      .ghh3-opt-row>span{white-space:nowrap;color:#9aa0a6;font-size:13px}
+      .ghh3-opt-row input,.ghh3-opt-row select{width:100%;height:42px;box-sizing:border-box;background:#2a2c30;color:#e3e3e3;border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:0 12px;font:15px Arial,sans-serif;outline:none}
+      .ghh3-opt-row input:focus,.ghh3-opt-row select:focus{border-color:#8ab4f8}
+      .ghh3-opt-row select{cursor:pointer;appearance:none;padding-right:26px;background-image:linear-gradient(45deg,transparent 50%,#9aa0a6 50%),linear-gradient(135deg,#9aa0a6 50%,transparent 50%);background-position:calc(100% - 15px) calc(50% - 2px),calc(100% - 10px) calc(50% - 2px);background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+      .ghh3-opt-row select option{background:#1e1f22;color:#e3e3e3}
+      .ghh3-sel-wrap{position:relative;width:100%}
+      .ghh3-sel-wrap select{position:absolute;inset:0;width:100%;height:100%;opacity:0;pointer-events:none}
+      .ghh3-sel-display{position:relative;display:flex;align-items:center;box-sizing:border-box;height:42px;padding:0 26px 0 12px;border-radius:7px;border:1px solid rgba(255,255,255,.12);background:#2a2c30;color:#e3e3e3;font:15px Arial,sans-serif;cursor:pointer}
+      .ghh3-sel-display:hover{border-color:rgba(255,255,255,.24)}
+      .ghh3-sel-display.open{border-color:#8ab4f8}
+      .ghh3-sel-display span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .ghh3-sel-display::after{content:"";position:absolute;right:15px;top:50%;width:5px;height:5px;margin-top:-4px;border-right:1px solid #9aa0a6;border-bottom:1px solid #9aa0a6;transform:rotate(45deg)}
+      .ghh3-sel-display.open::after{transform:rotate(-135deg);margin-top:-2px}
+      .ghh3-sel-panel{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:12;box-sizing:border-box;padding:4px;max-height:240px;overflow-y:auto;background:#1e1f22;border:1px solid rgba(255,255,255,.12);border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.55)}
+      .ghh3-sel-item{padding:8px 10px;border-radius:5px;font-size:15px;color:#e3e3e3;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .ghh3-sel-item:hover{background:#33363b}
+      .ghh3-sel-item.active{background:#8ab4f8;color:#0b1620;font-weight:600}
+      .ghh3-opt-center{display:flex;justify-content:center;margin-bottom:14px}
+      .ghh3-opt-seg{display:flex;flex:0 1 420px;min-width:0;box-sizing:border-box;height:42px;padding:3px;gap:3px;background:#2a2c30;border:1px solid rgba(255,255,255,.12);border-radius:7px}
+      .ghh3-opt-seg .ghh3-seg-btn{flex:1;min-width:0;border:none;border-radius:5px;background:transparent;color:#9aa0a6;font:15px Arial,sans-serif;cursor:pointer;white-space:nowrap}
+      .ghh3-opt-seg .ghh3-seg-btn:hover{color:#e3e3e3}
+      .ghh3-opt-seg .ghh3-seg-btn.active{background:#8ab4f8;color:#0b1620;font-weight:600}
+      .ghh3-seg-hidden{display:none}
+      .ghh3-opt-line{display:flex;align-items:center;gap:8px;min-width:0;width:100%}
+      .ghh3-opt-line .ghh3-sel-wrap{flex:1;min-width:0}
+      .ghh3-add-btn{flex:0 0 auto;height:42px;padding:0 18px;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:#2a2c30;color:#e3e3e3;font:15px Arial,sans-serif;cursor:pointer}
+      .ghh3-add-btn:hover{background:#33363b;border-color:rgba(255,255,255,.24)}
+      .ghh3-opt-actions{display:flex;justify-content:center;gap:10px;margin-top:18px}
+      .ghh3-opt-actions button{border:1px solid rgba(255,255,255,.12);border-radius:7px;background:#2a2c30;color:#c9ccd1;padding:8px 26px;cursor:pointer;font:18px Arial,sans-serif}
+      .ghh3-opt-actions button:hover{background:#33363b;color:#e3e3e3}
+      .ghh3-opt-actions button:last-child{background:#8ab4f8;border-color:#8ab4f8;color:#0b1620;font-weight:600}
     `;
     root.appendChild(style);
 
@@ -392,7 +576,7 @@ function createPanel(node) {
 
     const t2iWrap = make("div");
     t2iWrap.className = "ghh3-template-wrapper";
-    const t2iBadge = make("span", {}, "生图");
+    const t2iBadge = make("span", {}, "本地");
     t2iBadge.className = "ghh3-template-badge";
     const t2iSelect = document.createElement("select");
     t2iSelect.className = "ghh3-template-select";
@@ -401,7 +585,7 @@ function createPanel(node) {
 
     const i2iWrap = make("div");
     i2iWrap.className = "ghh3-template-wrapper";
-    const i2iBadge = make("span", {}, "编辑");
+    const i2iBadge = make("span", {}, "联网");
     i2iBadge.className = "ghh3-template-badge";
     const i2iSelect = document.createElement("select");
     i2iSelect.className = "ghh3-template-select";
@@ -410,6 +594,9 @@ function createPanel(node) {
 
     modes.append(t2iWrap, i2iWrap);
     root.append(modes);
+
+    const t2iPicker = enhanceTemplateSelect(t2iWrap, t2iSelect);
+    const i2iPicker = enhanceTemplateSelect(i2iWrap, i2iSelect);
 
     let restoringState = true;
     let restoreEpoch = 0;
@@ -429,48 +616,56 @@ function createPanel(node) {
 
     // 互斥自动归位与高亮同步逻辑 (选择一边，另一边自动重置回默认；胶囊标签同步高亮)
     const syncTemplateHighlight = () => {
-        const t2iActive = t2iSelect.value !== "自由发挥 (默认)";
-        const i2iActive = i2iSelect.value !== "自由发挥 (默认)";
-        t2iSelect.classList.toggle("active", t2iActive);
-        i2iSelect.classList.toggle("active", i2iActive);
+        const t2iActive = t2iSelect.value !== "手动输入";
+        const i2iActive = i2iSelect.value !== "手动输入";
+        t2iPicker.display.classList.toggle("active", t2iActive);
+        i2iPicker.display.classList.toggle("active", i2iActive);
+        t2iPicker.sync();
+        i2iPicker.sync();
         t2iWrap.classList.toggle("active", t2iActive);
         i2iWrap.classList.toggle("active", i2iActive);
     };
 
     t2iSelect.onchange = () => {
-        if (t2iSelect.value !== "自由发挥 (默认)") {
-            i2iSelect.value = "自由发挥 (默认)";
+        if (t2iSelect.value !== "手动输入") {
+            i2iSelect.value = "手动输入";
         }
         syncTemplateHighlight();
         persistState();
     };
 
     i2iSelect.onchange = () => {
-        if (i2iSelect.value !== "自由发挥 (默认)") {
-            t2iSelect.value = "自由发挥 (默认)";
+        if (i2iSelect.value !== "手动输入") {
+            t2iSelect.value = "手动输入";
         }
         syncTemplateHighlight();
         persistState();
     };
 
-    // 模板列表：从后端 templates/ 目录同步到两个下拉
+    // 模板列表：左下拉 = 成品提示词（fixed_prompt），右下拉 = API 改写模板（api_prompt）
     let templatesLoaded = false;
     let templatesFetchedAt = 0;
-    const applyTemplateLists = lists => {
-        for (const [kind, select, store] of [["t2i", t2iSelect, T2I_TEMPLATES], ["i2i", i2iSelect, I2I_TEMPLATES]]) {
-            const names = [TEMPLATE_DEFAULT, ...(Array.isArray(lists?.[kind]) ? lists[kind] : [])];
-            const current = select.value;
-            store.length = 0; store.push(...names);
-            select.replaceChildren(...names.map(title => new Option(title, title)));
-            select.value = names.includes(current) ? current : TEMPLATE_DEFAULT;
-        }
+    const fillSelect = (select, store, names) => {
+        const current = select.value;
+        store.length = 0; store.push(...names);
+        select.replaceChildren(...names.map(title => new Option(title, title)));
+        select.value = names.includes(current) ? current : TEMPLATE_DEFAULT;
+    };
+    const applyTemplateLists = (fixedNames, apiNames) => {
+        fillSelect(t2iSelect, T2I_TEMPLATES, [TEMPLATE_DEFAULT, ...(fixedNames || [])]);
+        fillSelect(i2iSelect, I2I_TEMPLATES, [TEMPLATE_DEFAULT, ...(apiNames || [])]);
         templatesLoaded = true;
         syncTemplateHighlight();
     };
     const refreshTemplates = async () => {
         templatesFetchedAt = Date.now();
-        try { applyTemplateLists(await fetchTemplateLists()); }
-        catch (error) { console.warn("Alili template list unavailable:", error); }
+        const [api, fixed] = await Promise.allSettled([fetchTemplateLists(), fetchFixedPrompts()]);
+        // 取不到就沿用下拉里已有的选项，不要把人选的那条冲掉
+        const apiNames = api.status === "fulfilled" ? (api.value?.api || api.value?.i2i) : I2I_TEMPLATES.slice(1);
+        const fixedNames = fixed.status === "fulfilled" ? fixed.value?.items : T2I_TEMPLATES.slice(1);
+        applyTemplateLists(fixedNames, apiNames);
+        if (api.status === "rejected") console.warn("Alili template list unavailable:", api.reason);
+        if (fixed.status === "rejected") console.warn("Alili fixed prompt list unavailable:", fixed.reason);
     };
     // 恢复工作流时，列表可能还没加载完：先临时补一个选项，等列表到了再校验
     const restoreTemplate = (select, store, value) => {
@@ -652,9 +847,74 @@ function createPanel(node) {
     // 参考图来自上游「加载图像」节点（只读，这里不上传、不修改）
     const refImages = () => findLoadNode(node)?._aliliGetImages?.() || [];
 
+    // ===== 改造预设（Shop）=====================================================
+    // 造型预设（prompt/look_prompt/*.md）：一条 md = 服装 / 姿势 / 发型 的一个组合。
+    // 选素材的交互在「加载图像 → 换形象」那边，这里只负责：拿到槽位组合 → 挑一条 → 填编辑器。
+    const SHOP_ROUTE = "/alili/image-workbench/shop";
+    const SHOP_SLOT_ORDER = ["cloth", "pose", "hair"];
+
+    let shopData = null;         // { presets: 成品原文 }
+
+    // 勾选的组合 → 那一条预设：slots 完全一致才命中
+    const shopKey = slots => [...slots].sort().join("+");
+    const shopPickPreset = active => {
+        const key = shopKey(active);
+        return (shopData?.presets || []).find(p => Array.isArray(p.slots) && shopKey(p.slots) === key) || null;
+    };
+
+    async function shopLoadData() {
+        // 每次都重读：在 Skill 里改了 md，下次「换形象 → 确定」就是新内容
+        const res = await api.fetchApi(`${SHOP_ROUTE}/presets`);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data?.error || "造型预设读取失败");
+        shopData = { presets: Array.isArray(data.presets) ? data.presets : [] };
+        return shopData;
+    }
+
+    const applyShopPreset = (text, quiet = false) => {
+        if (!text) return false;
+        const before = prompt.value;
+        pushPromptUndo({ text: before, start: before.length, end: before.length });
+        prompt.value = text;
+        renderPromptHighlights();
+        setPromptWidget(node, prompt.value);
+        syncStoryboardUI();
+        persistState();
+        if (!quiet) playNotificationSound();
+        return true;
+    };
+
+    // ---- 换形象 → 提示词：由「加载图像」点确定后调用 -------------------------
+    // 只收一个参数 auto（要不要顺手跑一次 ✦）。槽位组合从上游图像的 role 现读，
+    // 提示词按 slots 命中 md 原文填入编辑器。不传文本：传了就有第二份真相。
+    const ROLE_SLOT = { "人像": "face", "服装": "cloth", "姿势": "pose", "发型": "hair" };
+
+    node.__aliliLook = async auto => {
+        const images = findLoadNode(node)?._aliliGetImages?.() || [];
+        const slots = [];
+        for (const image of images) {
+            const slot = ROLE_SLOT[String(image.role || "").trim()];
+            if (slot && slot !== "face" && !slots.includes(slot)) slots.push(slot);
+        }
+        const ordered = SHOP_SLOT_ORDER.filter(slot => slots.includes(slot));
+        // 人像（图1）是脸库底图，不参与组合；没有任何搭配就没有对应预设，走通用失败分支
+        if (!ordered.length) return { ok: false, reason: "no-preset" };
+
+        try { await shopLoadData(); } catch (err) { return { ok: false, reason: "no-data", error: err.message }; }
+        const preset = shopPickPreset(ordered);
+        if (!preset) return { ok: false, reason: "no-preset" };
+
+        applyShopPreset(preset.text, true);
+        if (!auto) return { ok: true, preset: preset.title, optimized: false };
+        // 不 await：优化要十几秒，交给 ✦ 自己转圈，弹窗先关掉
+        runPromptOptimization().catch(() => {});
+        return { ok: true, preset: preset.title, optimized: true };
+    };
+
     const serializedState = () => JSON.stringify({
         prompt: prompt.value,
-        t2i_template: t2iSelect.value,
+        // 成品提示词：只存名字，正文每次跑图现读磁盘（改文件即生效，不用重选）
+        fixed_preset: t2iSelect.value === TEMPLATE_DEFAULT ? "" : t2iSelect.value,
         i2i_template: i2iSelect.value,
         optimizerBefore,
         storyboard: storyboardOn,
@@ -688,7 +948,7 @@ function createPanel(node) {
     // 左：API / Skill / 分镜图（数字直接显示在按钮上）  右：优化 / 重做 / 撤销（撤销在最右）
     const storyboardBtn = make("button", {}, "分镜图"); storyboardBtn.className = "ghh3-prompt-tool ghh3-shot-toggle";
     const templateEditBtn = make("button", {}, "Skill"); templateEditBtn.className = "ghh3-prompt-tool";
-    templateEditBtn.title = "编辑提示词模板（Skill）";
+    templateEditBtn.title = "提示词库：成品提示词 / API 模板 / 造型组合";
     
     const syncHistoryButtons = () => {
         resetPrompt.disabled = promptHistory.undo.length === 0;
@@ -724,23 +984,60 @@ function createPanel(node) {
     function openTemplateEditor() {
         const overlay = make("div"); overlay.className = "ghh3-opt-overlay";
         const dialog = make("div"); dialog.className = "ghh3-opt-dialog";
-        dialog.style.width = "min(640px, calc(100vw - 30px))";
         overlay.append(dialog);
-        const title = make("div", {}, "编辑提示词模板"); title.className = "ghh3-opt-title"; dialog.append(title);
+        const title = make("div", {}, "提示词库 · prompt/"); title.className = "ghh3-opt-title"; dialog.append(title);
 
         const row = (label, control) => {
-            const wrap = make("label"); wrap.className = "ghh3-opt-row";
+            // 必须用 div：<label> 会把点击转发给里面的控件，自绘下拉的点击会顺带
+            // 触发隐藏的原生 select 弹层，两套菜单叠在一起就错乱
+            const wrap = make("div"); wrap.className = "ghh3-opt-row";
             wrap.append(make("span", {}, label), control); dialog.append(wrap);
             return control;
         };
-        const NEW_ITEM = "__new__";
-        const kindSel = row("类型", make("select"));
-        kindSel.append(new Option("生图Skill (t2i)", "t2i"), new Option("编辑Skill (i2i)", "i2i"));
-        const nameSel = row("选择模板", make("select"));
-        const nameInp = row("模板名称", make("input"));
-        nameInp.placeholder = "即文件名；改成新名字再保存 = 另存为新模板";
+        // 类型：三段式按钮（本地 / 联网 / 形象）。kindSel 只用来承载值，不进界面
+        const kindSeg = make("div"); kindSeg.className = "ghh3-opt-seg";
+        const kindSel = make("select"); kindSel.className = "ghh3-seg-hidden";
+        kindSel.append(
+            new Option("本地提示词", "fixed"),
+            new Option("联网提示词", "api"),
+            new Option("形象提示词", "look"),
+        );
+        const kindButtons = [["本地提示词", "fixed"], ["联网提示词", "api"], ["形象提示词", "look"]].map(([text, value]) => {
+            const btn = make("button", {}, text);
+            btn.className = "ghh3-seg-btn";
+            btn.dataset.value = value;
+            btn.onclick = () => {
+                if (kindSel.value === value) return;
+                kindSel.value = value;
+                kindSel.dispatchEvent(new Event("change"));
+            };
+            kindSeg.appendChild(btn);
+            return btn;
+        });
+        const syncKind = () => kindButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.value === kindSel.value));
+        // 类型那行不要标签文字，三段条居中
+        const kindRow = make("div"); kindRow.className = "ghh3-opt-center";
+        kindRow.appendChild(kindSeg);
+        dialog.append(kindRow);
+
+        // 选择文件：下拉 + 右侧「新增」（把原来埋在选项里的「＋ 新建」挪出来）
+        const nameLine = make("div"); nameLine.className = "ghh3-opt-line";
+        const nameSel = make("select");
+        const nameAdd = make("button", {}, "新增"); nameAdd.className = "ghh3-add-btn";
+        nameLine.append(nameSel, nameAdd);
+        row("选择文件", nameLine);
+
+        const nameInp = row("文件名", make("input"));
+        nameInp.placeholder = "即文件名；改成新名字再保存 = 另存为新文件";
+        // 下拉换成自绘弹层（原生 option 列表尖角、系统配色，改不动）
+        const namePicker = enhanceOptSelect(nameSel);
+        nameAdd.onclick = () => {
+            nameInp.value = ""; text.value = "";
+            setStatus("新建模板：填写名称和内容后保存");
+            nameInp.focus();
+        };
         const text = make("textarea"); text.className = "ghh3-tpl-text"; text.spellcheck = false;
-        text.placeholder = "写给大模型的专属指令。分镜模板请要求输出  公共设定 + 【1】…【2】…  的格式。";
+        text.placeholder = "成品提示词：直接送文本编码的正文。API 模板：写给大模型的专属指令。造型组合：带 frontmatter 的成品（换形象时按槽位命中）。";
         for (const type of ["keydown", "keyup"]) text.addEventListener(type, e => e.stopPropagation());
         const status = make("div"); status.className = "ghh3-tpl-status";
         dialog.append(text, status);
@@ -748,27 +1045,30 @@ function createPanel(node) {
         const closeBtn = make("button", {}, "关闭"); const saveBtn = make("button", {}, "保存");
         actions.append(closeBtn, saveBtn); dialog.append(actions);
 
-        const setStatus = (message, bad = false) => { status.textContent = message; status.style.color = bad ? "#d98d97" : "#8ba2b5"; };
+        const setStatus = (message, bad = false) => { status.textContent = message; status.style.color = bad ? "#d98d97" : "#9aa0a6"; };
         const guard = fn => async (...args) => { try { await fn(...args); } catch (error) { setStatus(error.message || String(error), true); } };
 
         const loadContent = async () => {
-            if (nameSel.value === NEW_ITEM) {
+            if (!nameSel.value) {
                 nameInp.value = ""; text.value = "";
-                setStatus("新建模板：填写名称和内容后保存"); return;
+                setStatus("这个分类下还没有模板，点「新增」写一个"); return;
             }
             const res = await api.fetchApi(`${OPTIMIZER_ROUTE}/template?` + new URLSearchParams({ kind: kindSel.value, name: nameSel.value }));
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || "读取失败");
             nameInp.value = nameSel.value; text.value = data.content || ""; setStatus("");
+            namePicker.sync();
         };
         const loadList = async (preferName = "") => {
-            const names = (await fetchTemplateLists())[kindSel.value] || [];
-            nameSel.replaceChildren(new Option("＋ 新建模板", NEW_ITEM), ...names.map(n => new Option(n, n)));
-            nameSel.value = names.includes(preferName) ? preferName : (names[0] || NEW_ITEM);
+            const names = await fetchPromptNames(kindSel.value);
+            nameSel.replaceChildren(...names.map(n => new Option(n, n)));
+            if (!names.length) nameSel.append(new Option("（暂无，点「新增」）", ""));
+            nameSel.value = names.includes(preferName) ? preferName : (names[0] || "");
+            namePicker.sync();
             await loadContent();
         };
 
-        kindSel.onchange = guard(() => loadList());
+        kindSel.onchange = guard(async () => { syncKind(); await loadList(); });
         nameSel.onchange = guard(loadContent);
         closeBtn.onclick = () => overlay.remove();
         saveBtn.onclick = guard(async () => {
@@ -783,10 +1083,11 @@ function createPanel(node) {
             setStatus(`已保存：${data.name}`);
         });
 
-        const activeKind = (i2iSelect.value !== TEMPLATE_DEFAULT && t2iSelect.value === TEMPLATE_DEFAULT) ? "i2i" : "t2i";
+        const activeKind = (i2iSelect.value !== TEMPLATE_DEFAULT && t2iSelect.value === TEMPLATE_DEFAULT) ? "api" : "fixed";
         kindSel.value = activeKind;
+        syncKind();
         document.body.append(overlay);
-        guard(loadList)(activeKind === "i2i" ? i2iSelect.value : t2iSelect.value);
+        guard(loadList)(activeKind === "api" ? i2iSelect.value : t2iSelect.value);
     }
 
     // API 设置模块（配置来自根目录 API/ 文件夹）
@@ -1025,13 +1326,8 @@ function createPanel(node) {
         const before = prompt.value;
         const task = refImages().length > 0 ? "I2I" : "T2I";
 
-        // 获取当前被激活的模板标题
-        let activeTemplate = "";
-        if (t2iSelect.value !== TEMPLATE_DEFAULT) {
-            activeTemplate = `t2i/${t2iSelect.value}`;
-        } else if (i2iSelect.value !== TEMPLATE_DEFAULT) {
-            activeTemplate = `i2i/${i2iSelect.value}`;
-        }
+        // 只有「编辑」下拉是给大模型的改写模板；左「生图」下拉是本地成品提示词，不参与反推
+        const activeTemplate = i2iSelect.value !== TEMPLATE_DEFAULT ? i2iSelect.value : "";
 
         try {
             optimizing = true;
@@ -1047,25 +1343,14 @@ function createPanel(node) {
                 optimizePrompt.textContent = `${s}s`;
             }, 1000);
 
-            const mediaPayload = [];
-                for (const [index, entry] of refImages().entries()) {
-                    const ordinal = index + 1;
-                    const imgUrl = fileUrl(entry.name);
-                    const b64 = await new Promise((res, rej) => {
-                        const i = new Image(); i.crossOrigin = "anonymous";
-                        i.onload = () => {
-                            const c = document.createElement("canvas");
-                            const scale = Math.min(1, 512 / Math.max(i.naturalWidth, i.naturalHeight));
-                            c.width = Math.max(1, Math.round(i.naturalWidth * scale));
-                            c.height = Math.max(1, Math.round(i.naturalHeight * scale));
-                            c.getContext("2d").drawImage(i, 0, 0, c.width, c.height);
-                            res(c.toDataURL("image/jpeg", 0.6));
-                        };
-                        i.onerror = () => rej(new Error("Image read error"));
-                        i.src = imgUrl;
-                    });
-                    mediaPayload.push({ label: `<image${ordinal}>`, images: [b64] });
-                }
+            // 图像交给后端按 name + crop.rect 读取/裁剪（与加载节点 _apply_crop 同口径）。
+            // 前端不再按文件名读原图：那样会绕过裁剪，导致 API 看到全图、反推出全身提示词。
+            // 没裁的图 crop 为 null，后端原样透传。
+            const mediaPayload = refImages().map((entry, index) => ({
+                label: `<image${index + 1}>`,
+                name: entry.name,
+                crop: entry.crop || null,
+            }));
 
             const reqBody = {
                 request_id: optimizerRequestId,
@@ -1155,8 +1440,8 @@ function createPanel(node) {
                     renderPromptHighlights();
                     setPromptWidget(node, prompt.value);                   
 
-                    // 恢复模板选项
-                    restoreTemplate(t2iSelect, T2I_TEMPLATES, restored.t2i_template);
+                    // 恢复模板选项（fixed_preset 是新键，t2i_template 是旧工作流里的老键，兼容迁移）
+                    restoreTemplate(t2iSelect, T2I_TEMPLATES, restored.fixed_preset || restored.t2i_template);
                     restoreTemplate(i2iSelect, I2I_TEMPLATES, restored.i2i_template);
                     syncTemplateHighlight();
 

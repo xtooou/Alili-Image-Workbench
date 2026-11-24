@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
+from collections import OrderedDict
+from io import BytesIO
 
 import folder_paths
 import numpy as np
@@ -28,6 +31,39 @@ UI_IMAGES = "alili_images"
 def _tensor_to_pil(tensor) -> Image.Image:
     array = 255.0 * tensor.cpu().numpy()
     return Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
+
+
+# ==============================================================================
+# 素材入库的临时缓存：execute 时把**单张**出图编码成 PNG 字节留在内存，
+# 前端点「存为素材」→ 选分类 / 填名字 → POST 到 /alili/asset/import 直接写盘。
+#
+# 刻意不读 output 里的文件、也不经过浏览器：两套命名空间互不相干，
+# 不存在「去 output 认哪一张」的重名风险，也没有浏览器缓存干扰。
+# 进程重启即失效 —— 素材都是出图后立刻入库，可接受。
+# ==============================================================================
+
+PENDING_LIMIT = 30
+_PENDING: "OrderedDict[str, bytes]" = OrderedDict()
+
+
+def _remember(tensor) -> str:
+    """把一张图编码成 PNG 字节缓存起来，返回 token。"""
+    buffer = BytesIO()
+    _tensor_to_pil(tensor).save(buffer, format="PNG", compress_level=4)
+    token = uuid.uuid4().hex
+    _PENDING[token] = buffer.getvalue()
+    while len(_PENDING) > PENDING_LIMIT:
+        _PENDING.popitem(last=False)
+    return token
+
+
+def get_pending(token: str) -> bytes | None:
+    """按 token 取缓存字节（不删除，写盘失败时可重试）。"""
+    return _PENDING.get(token)
+
+
+def drop_pending(token: str) -> None:
+    _PENDING.pop(token, None)
 
 
 def _build_metadata(prompt, extra_pnginfo):
@@ -85,4 +121,7 @@ class AliliSaveImage(io.ComfyNode):
     def execute(cls, images, filename_prefix=DEFAULT_PREFIX):
         metadata = _build_metadata(cls.hidden.prompt, cls.hidden.extra_pnginfo)
         results = _save_tensors(images, filename_prefix or DEFAULT_PREFIX, metadata)
+        # 只有单图才提供「存为素材」：分镜多图不参与素材入库
+        if len(images) == 1:
+            results[0]["assetToken"] = _remember(images[0])
         return io.NodeOutput(ui={UI_IMAGES: results})

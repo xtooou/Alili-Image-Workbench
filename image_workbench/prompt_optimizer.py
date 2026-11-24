@@ -1,33 +1,52 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import re
 from pathlib import Path
 
 from aiohttp import web
+from PIL import Image
 from server import PromptServer
 
 from ..api import api as alili_api
+from ..Expanded_Node.Load_image import _apply_crop, _load_image
+
+# 发给大模型的参考图：最长边缩放上限（原来前端是 512 / jpeg 0.6，保持一致）
+API_IMAGE_MAX_SIDE = 512
+API_IMAGE_JPEG_QUALITY = 60
 
 
 
 # ==============================================================================
-# 提示词模板库：每个模板是一个独立文件  templates/<kind>/<模板名>.md
-#   kind = t2i  → 前端「生图」下拉
-#   kind = i2i  → 前端「编辑」下拉
-# 文件内容就是给大模型的专属指令。新增 / 修改文件后，前端下拉会自动刷新，无需重启。
+# 提示词库：全部收在 prompt/ 一个目录下，三类各一个子目录
+#   prompt/api_prompt/    → 给大模型看的「改写指令」（走 API，前端「编辑」下拉）
+#   prompt/fixed_prompt/  → 写好的成品提示词（不走 API，直接送文本编码，前端「生图」下拉）
+#   prompt/look_prompt/   → 改造弹窗的组合成品（换装 / 换姿势 / 换发型 …）
+# 新增 / 修改文件后，前端下拉会自动刷新，无需重启。
 # ==============================================================================
-TEMPLATE_ROOT = Path(__file__).resolve().parents[1] / "templates"
-TEMPLATE_KINDS = ("t2i", "i2i")
+PROMPT_ROOT = Path(__file__).resolve().parents[1] / "prompt"
+API_PROMPT_ROOT = PROMPT_ROOT / "api_prompt"
+FIXED_PROMPT_ROOT = PROMPT_ROOT / "fixed_prompt"
+LOOK_PROMPT_ROOT = PROMPT_ROOT / "look_prompt"
+API_ALIASES = {"t2i", "i2i", "api", "api_prompt"}
+FIXED_ALIASES = {"fixed", "fixed_prompt"}
+LOOK_ALIASES = {"look", "look_prompt"}
 TEMPLATE_DEFAULT_TITLE = "自由发挥 (默认)"
 TEMPLATE_MAX_CHARS = 65536
 _TEMPLATE_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def _template_dir(kind: str) -> Path:
-    if kind not in TEMPLATE_KINDS:
-        raise ValueError(f"未知模板类型: {kind}")
-    return TEMPLATE_ROOT / kind
+    key = str(kind or "api").strip().lower()
+    if key in API_ALIASES:
+        return API_PROMPT_ROOT
+    if key in FIXED_ALIASES:
+        return FIXED_PROMPT_ROOT
+    if key in LOOK_ALIASES:
+        return LOOK_PROMPT_ROOT
+    raise ValueError(f"未知模板类型: {kind}")
 
 
 def _clean_template_name(name) -> str:
@@ -72,11 +91,13 @@ def _write_template(kind: str, name, content) -> str:
 
 
 def _template_instruction(template: str) -> tuple[str, str]:
-    """前端传来的 template 形如 't2i/四宫格分镜'。返回 (显示名, 指令文本)；找不到则指令为空，走通用规则。"""
+    """前端传来的 template 形如 '提取发型'（平铺）或旧格式 'i2i/提取发型'。返回 (显示名, 指令文本)；找不到则指令为空，走通用规则。"""
     value = str(template or "").strip()
-    kind, _, name = value.partition("/")
-    if kind not in TEMPLATE_KINDS or not name:
+    if not value:
         return value, ""
+    kind, sep, name = value.partition("/")
+    if not sep:
+        kind, name = "api", value
     try:
         return name, _read_template(kind, name).strip()
     except (OSError, ValueError):
@@ -142,12 +163,58 @@ def _system_prompt(
         )
 
 
+def _media_data_url(item: dict) -> str | None:
+    """把一条 media 变成可发给大模型的 data URL。
+
+    两条来源：
+      - 新格式：name + crop → 后端按与加载节点 _apply_crop 相同的口径读原图、裁剪、内存缩放。
+        这样 API 看到的就是用户在节点卡片里看到的那块，而不是磁盘全图。
+      - 旧格式：images（前端 already base64）→ 原样透传，兼容老工作流 / 其它调用方。
+
+    读图 / 裁剪失败一律返回 None：宁可少一张参考图，也不把全图悄悄送给大模型。
+    """
+    item = item if isinstance(item, dict) else {}
+
+    # 旧格式：前端直接传来的 base64，保持兼容
+    legacy = item.get("images")
+    if isinstance(legacy, list) and legacy and isinstance(legacy[0], str) and legacy[0].startswith("data:"):
+        return legacy[0]
+
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    try:
+        image = _load_image(name)          # torch [1,H,W,C]，含路径白名单校验
+        crop = item.get("crop")
+        if isinstance(crop, dict):
+            # 绑定校验：换图后旧框的 image 与当前 name 不符 → 当作没裁，原图透传
+            bound = crop.get("image")
+            if bound is not None and str(bound) != name:
+                crop = None
+            image = _apply_crop(image, crop)
+        # 张量 → PIL → 最长边缩放 → JPEG data URL（全程内存，不落盘、不改原图）
+        array = (image[0].clamp(0, 1).cpu().numpy() * 255.0).astype("uint8")
+        pil = Image.fromarray(array, "RGB")
+        scale = min(1.0, API_IMAGE_MAX_SIDE / max(pil.width, pil.height))
+        if scale < 1.0:
+            pil = pil.resize(
+                (max(1, round(pil.width * scale)), max(1, round(pil.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        buffer = io.BytesIO()
+        pil.save(buffer, format="JPEG", quality=API_IMAGE_JPEG_QUALITY)
+        return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
 def _user_parts(prompt: str, media: list[dict], read_media: bool) -> list[dict]:
     parts = [{"type": "text", "text": "User description:\n" + (prompt or "Create a high-quality visual masterpiece.")}]
     for item in media:
         label = str(item.get("label") or "")
         if read_media:
-            for index, data_url in enumerate(item.get("images") or []):
+            data_url = _media_data_url(item)
+            if data_url:
                 parts.append({"type": "text", "text": f"Reference image for {label}:"})
                 parts.append({"type": "image_url", "image_url": {"url": data_url, "detail": "low"}})
         else:
@@ -195,7 +262,21 @@ async def _run_prompt_optimization(payload: dict) -> str:
 
 
 async def list_prompt_templates(_request):
-    return web.json_response({kind: _list_templates(kind) for kind in TEMPLATE_KINDS})
+    api_list = _list_templates("api")
+    # api 是平铺的，t2i / i2i 两个键保留只为兼容旧前端
+    return web.json_response({"api": api_list, "t2i": api_list, "i2i": api_list})
+
+
+async def list_fixed_prompts(_request):
+    return web.json_response({"items": _list_templates("fixed")})
+
+
+async def list_prompts_by_kind(request):
+    """统一清单：kind = fixed / api / look（Skill 编辑弹窗用）"""
+    try:
+        return web.json_response({"items": _list_templates(str(request.query.get("kind") or "api"))})
+    except Exception as error:
+        return web.json_response({"error": str(error)}, status=400)
 
 
 async def read_prompt_template(request):
@@ -264,6 +345,8 @@ def register_prompt_optimizer_routes() -> bool:
         routes.post(f"{prefix}/optimize")(optimize_prompt)
         routes.post(f"{prefix}/cancel")(cancel_prompt_optimization)
         routes.get(f"{prefix}/templates")(list_prompt_templates)
+        routes.get(f"{prefix}/fixed")(list_fixed_prompts)
+        routes.get(f"{prefix}/list")(list_prompts_by_kind)
         routes.get(f"{prefix}/template")(read_prompt_template)
         routes.post(f"{prefix}/template")(save_prompt_template)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from pathlib import Path
 
 from comfy_api.latest import io
 
@@ -109,6 +110,25 @@ def _parse_state(alili_state_json):
     return state if isinstance(state, dict) else {}
 
 
+FIXED_PROMPT_ROOT = Path(__file__).resolve().parents[1] / "prompt" / "fixed_prompt"
+
+
+def read_fixed_prompt(name):
+    """读 prompt/fixed_prompt/<名字>.md 的成品提示词，原样返回（不做任何替换/清洗）；读不到返回空串。
+
+    每次执行都现读磁盘，所以在文件里改了内容，下次跑图立刻生效，不用重新选下拉。
+    """
+    value = str(name or "").strip()
+    if value.lower().endswith(".md"):
+        value = value[:-3].strip()
+    if not value or value.startswith(".") or "/" in value or "\\" in value:
+        return ""
+    try:
+        return (FIXED_PROMPT_ROOT / f"{value}.md").read_text(encoding="utf-8-sig")
+    except OSError:
+        return ""
+
+
 def _extract_shot_index(state):
     try:
         return int(state.get("shot_index", 0))
@@ -145,10 +165,16 @@ class AliliImageWorkbench(io.ComfyNode):
     @classmethod
     def execute(cls, aspect_ratio, megapixels, multiple, prompt, alili_state_json="", images=None):
         state = _parse_state(alili_state_json)
-        if isinstance(state.get("prompt"), str):
-            prompt = state["prompt"]
-        prompt = pick_shot(prompt, _extract_shot_index(state))
-        prompt = normalize_image_tags(prompt)
+
+        # 成品提示词（fixed_prompt）：选中就走内部，原样送编码器，一个字都不动
+        fixed_text = read_fixed_prompt(state.get("fixed_preset"))
+        if fixed_text.strip():
+            prompt = fixed_text
+        else:
+            if isinstance(state.get("prompt"), str):
+                prompt = state["prompt"]
+            prompt = pick_shot(prompt, _extract_shot_index(state))
+            prompt = normalize_image_tags(prompt)
 
         # 自适应：沿用首张参考图的原始宽高比（不再包含扩图外补）
         source_w, source_h = first_image_size(images)

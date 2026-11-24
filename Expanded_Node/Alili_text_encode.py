@@ -15,6 +15,7 @@ CFG <= 1 时负向条件零化，> 1 才启用真实负向。空 latent 规格�
 """
 from __future__ import annotations
 
+import logging
 import math
 
 from comfy_api.latest import io
@@ -26,14 +27,48 @@ NODE_CATEGORY = "Alili"
 WORKBENCH_TYPE = "Alili"
 
 
-def _auto_resolution(width: int, height: int) -> int:
-    """Qwen 2.1 参考图缩放边长 = 工作台画布面积的平方根，按官方 32 步进钳到 32..4096。
+# 参考图面积预算（总像素）：官方节点会把每张参考图缩放到 resolution × resolution 的面积。
+# 之前的写法是「每张参考图 = 画布面积」，2MP 画布 + 4 张参考图 = 10MP 的 token，
+# 而 Qwen 2.1 的 block_causal 注意力代价随总长度平方增长 → 单步耗时直接翻几倍。
+# 这里改成和孤海 GHIL 完全相同的分档规则：图越多，每张摊到的面积越小。
+REF_AREA_TWO_IMAGES = 2048 * 2048   # 1~2 张：最多跟画布同面积（单图编辑画质优先）
+REF_AREA_FOUR_IMAGES = 1024 * 1024  # 3~4 张：每张 1MP（与 GHIL 默认一致）
+REF_AREA_MANY_IMAGES = 768 * 768    # 5 张以上：每张 0.59MP
 
-    它只决定「参考图看得多清楚 / 显存占用」，不再决定出图画幅；
-    出图画幅由工作台 width / height 决定（见 encoders._qwen21_latent）。
+
+def _ref_resolution(width: int, height: int, count: int) -> int:
+    """按参考图张数摊薄面积，返回官方节点要的 resolution（面积 = resolution²）。
+
+    单图/两张：保持画布面积（画质优先，与旧行为一致，单图编辑不受影响）。
+    三张以上：回归 GHIL 的 1024² / 768²，避免多图时 token 爆炸拖慢采样。
     """
-    side = round(math.sqrt(max(1, int(width) * int(height))) / 32) * 32
-    return max(32, min(4096, int(side)))
+    count = max(0, int(count))
+    if count <= 0:
+        return 1024
+    if count <= 2:
+        area = min(max(1, int(width) * int(height)), REF_AREA_TWO_IMAGES)
+    elif count <= 4:
+        area = REF_AREA_FOUR_IMAGES
+    else:
+        area = REF_AREA_MANY_IMAGES
+    side = round(math.sqrt(area) / 32) * 32
+    return max(256, min(2048, int(side)))
+
+
+def _override_resolution(value):
+    """工作台可选的「参考图清晰度」覆盖：自动 / 768 / 1024 / 1344 / 2048。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in ("自动", "auto", "0"):
+        return None
+    try:
+        side = int(round(float(text)))
+    except (TypeError, ValueError):
+        return None
+    if side <= 0:
+        return None
+    return max(256, min(2048, round(side / 32) * 32))
 
 
 class AliliTextEncode(io.ComfyNode):
@@ -96,9 +131,23 @@ class AliliTextEncode(io.ComfyNode):
         height = int(data.get("height", 1024))
         refs = image_list(data.get("load"))
 
-        # 旧工作流里常残留 resolution=1024，且前端从未写入该隐藏 widget；
-        # 一律按工作台画布自动推导，忽略传入值，保证老工作流也能立即生效。
-        qwen_resolution = _auto_resolution(width, height)
+        # 参考图分辨率优先级：工作台 ref_res 覆盖 > 按张数自动分档。
+        # 只走 Qwen 自己的两条来源。**不读加载节点的「参考图缩放」**：
+        # 那个开关是给 MOSS / H3 编辑用的，两家的缩放语义不同
+        # （MOSS 按 edit 格式吃固定短边、H3 按面积匹配），
+        # 拿它的 MP 换算 Qwen 的 resolution 属于跨家族串味，MOSS 的编辑质量会跟着变。
+        ref_res = _override_resolution(data.get("ref_res"))
+        source = "工作台设定"
+        if not ref_res:
+            ref_res = _ref_resolution(width, height, len(refs))
+            source = "按张数自动"
+        qwen_resolution = ref_res
+        if refs:
+            tokens = (width // 16) * (height // 16) + len(refs) * (qwen_resolution // 16) ** 2
+            logging.info(
+                "Alili 文本编码：参考图 %d 张 → 每张 %dpx（面积 %.2fMP，来源：%s），画布 %dx%d，总 token≈%d",
+                len(refs), qwen_resolution, qwen_resolution ** 2 / 1048576, source, width, height, tokens,
+            )
 
         positive, negative, latent = encoders.encode(
             family=model_family,

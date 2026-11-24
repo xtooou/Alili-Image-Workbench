@@ -50,7 +50,21 @@ def first_image_size(load):
 # ==============================================================================
 
 def _path_of(name):
-    path = folder_paths.get_annotated_filepath(str(name))
+    """解析图像路径。
+
+    - 素材库内的绝对路径：放行（白名单校验，只认素材根目录下的文件）
+    - 其余按 ComfyUI 惯例走 input / output / temp 相对路径
+    """
+    raw = str(name)
+    if os.path.isabs(raw):
+        from ..image_workbench.assets import is_within_root
+        if not is_within_root(raw):
+            raise ValueError(f"图像不在素材库目录内：{raw}")
+        if not os.path.isfile(raw):
+            raise ValueError(f"找不到图像文件：{raw}（可能已被删除，请重新选择）")
+        return raw
+
+    path = folder_paths.get_annotated_filepath(raw)
     if not path or not os.path.isfile(path):
         raise ValueError(f"找不到图像文件：{name}（可能已被删除，请在加载图像节点里移除后重新添加）")
     return path
@@ -133,6 +147,36 @@ def _resize_tensor(image, megapixels):
     return torch.from_numpy(out[None,])
 
 
+# ==============================================================================
+# 裁剪：归一化 rect（x, y, w, h 都是 0~1）切张量
+# 只在内存里切，不改 input 里的原图，也不改文件 mtime。
+# 顺序固定「先裁剪、后缩放」：裁剪决定构图，缩放决定总像素。
+# ==============================================================================
+
+def _apply_crop(image, crop):
+    if not isinstance(crop, dict):
+        return image
+    rect = crop.get("rect")
+    if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+        return image
+    try:
+        x, y, w, h = (min(max(float(value), 0.0), 1.0) for value in rect)
+    except (TypeError, ValueError):
+        return image
+
+    w = min(w, 1.0 - x)
+    h = min(h, 1.0 - y)
+    if w <= 0.0 or h <= 0.0:
+        return image
+
+    _, height, width, _ = image.shape
+    left = min(int(round(x * width)), width - 1)
+    top = min(int(round(y * height)), height - 1)
+    right = min(width, max(left + 1, int(round((x + w) * width))))
+    bottom = min(height, max(top + 1, int(round((y + h) * height))))
+    return image[:, top:bottom, left:right, :]
+
+
 class AliliLoadImage(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -152,11 +196,16 @@ class AliliLoadImage(io.ComfyNode):
         state = _parse_state(alili_state_json)
 
         names = []
+        images = []
         for item in (state.get("images") or [])[:MAX_IMAGES]:
             name = item.get("name") if isinstance(item, dict) else item
-            if isinstance(name, str) and name:
-                names.append(name)
-        images = [_load_image(name) for name in names]
+            if not isinstance(name, str) or not name:
+                continue
+            image = _load_image(name)
+            if isinstance(item, dict):
+                image = _apply_crop(image, item.get("crop"))
+            names.append(name)
+            images.append(image)
 
         # 可选缩放：只在内存里做，原图文件一个字节都不动。
         # include_first=False 时第 1 张（主体参考）保持原样，其余按总像素等比缩放。

@@ -8,6 +8,8 @@ from .Expanded_Node.Save_image import AliliSaveImage
 from .Expanded_Node.Workbench import AliliImageWorkbench
 from .image_workbench import prompt_optimizer  # noqa: F401 (导入即注册提示词优化 HTTP 路由)
 from .image_workbench import file_clipboard  # noqa: F401 (导入即注册「复制本地文件到剪贴板」路由)
+from .image_workbench import assets  # noqa: F401 (导入即注册素材库全部路由：入库 / 浏览 / 缩略图 / 配置)
+from .image_workbench import shop_presets  # noqa: F401 (导入即注册「改造预设」列表与 AI 槽位判定路由)
 
 NODE_CLASS_MAPPINGS = {
     "AliliLoadImage": AliliLoadImage,

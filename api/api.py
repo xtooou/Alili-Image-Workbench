@@ -219,7 +219,7 @@ def fetch_models(base_url, api_key, timeout=15):
 SETTINGS_JS = r"""import { api } from "/scripts/api.js";
 
 const ROUTE = "/alili/api";
-const COLOR_ERR = "#e5737f", COLOR_OK = "#6fcf97", COLOR_MUTED = "#8294a2";
+const COLOR_ERR = "#d98d97", COLOR_OK = "#6fcf97", COLOR_MUTED = "#9aa0a6";
 
 async function request(path, options) {
     const res = await api.fetchApi(`${ROUTE}${path}`, options);
@@ -252,27 +252,44 @@ function injectStyle() {
     const style = document.createElement("style");
     style.id = "alili-api-style";
     style.textContent = `
-    .alili-api-overlay{position:fixed;inset:0;z-index:10100;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.58);font:13px Arial,sans-serif}
-    .alili-api-dialog{width:min(460px,calc(100vw - 30px));box-sizing:border-box;padding:18px 20px;background:#17222c;color:#d7e3ec;border:1px solid #344958;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
-    .alili-api-head{display:flex;align-items:center;gap:8px;margin-bottom:14px;font-size:15px;font-weight:bold}
+    /* 与「存为素材」「提示词库」同一套暗色板：底 #1e1f22、控件 #2a2c30、42px 高、圆角 7、正文 15px */
+    .alili-api-overlay{position:fixed;inset:0;z-index:10100;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.58);font:15px Arial,sans-serif}
+    .alili-api-dialog{width:min(520px,calc(100vw - 32px));box-sizing:border-box;padding:17px 19px 16px;background:#1e1f22;color:#e3e3e3;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 18px 48px rgba(0,0,0,.55)}
+    .alili-api-head{display:flex;align-items:center;gap:8px;margin-bottom:13px;font-size:15px;font-weight:600}
     .alili-api-head .grow{flex:1}
-    .alili-api-row{display:grid;grid-template-columns:84px minmax(0,1fr);align-items:center;gap:8px;margin-bottom:10px}
+    .alili-api-row{display:grid;grid-template-columns:88px minmax(0,1fr);align-items:center;gap:10px;margin-bottom:14px}
+    .alili-api-row>span{color:#9aa0a6;font-size:13px;white-space:nowrap}
     .alili-api-row.hidden{display:none}
-    .alili-api-field{display:flex;gap:6px;min-width:0;position:relative}
-    .alili-api-dialog input,.alili-api-dialog select{flex:1;min-width:0;box-sizing:border-box;height:30px;padding:0 8px;background:#1d2b36;color:#dce7ee;border:1px solid #3a4d5b;border-radius:5px;font:inherit}
-    .alili-api-dialog input:focus,.alili-api-dialog select:focus{outline:none;border-color:#4c8fa0}
-    .alili-api-btn{height:30px;min-width:30px;padding:0 10px;background:#1d2b36;color:#cbd8e0;border:1px solid #3a4d5b;border-radius:5px;cursor:pointer;font:inherit}
-    .alili-api-btn:hover{background:#263b49;border-color:#4c6879}
-    .alili-api-btn:disabled{opacity:.6;cursor:default}
-    .alili-api-btn.primary{background:#17535a;border-color:#26717a;color:#e0f2f2}
+    .alili-api-field{display:flex;gap:8px;min-width:0;position:relative}
+    .alili-api-dialog input,.alili-api-dialog select{flex:1;min-width:0;box-sizing:border-box;height:42px;padding:0 12px;background:#2a2c30;color:#e3e3e3;border:1px solid rgba(255,255,255,.12);border-radius:7px;font:15px Arial,sans-serif;outline:none}
+    .alili-api-dialog input:focus,.alili-api-dialog select:focus{border-color:#8ab4f8}
+    .alili-api-btn{height:42px;min-width:42px;padding:0 14px;background:#2a2c30;color:#e3e3e3;border:1px solid rgba(255,255,255,.12);border-radius:7px;cursor:pointer;font:15px Arial,sans-serif}
+    .alili-api-btn:hover{background:#33363b;border-color:rgba(255,255,255,.24)}
+    .alili-api-btn:disabled{opacity:.55;cursor:default}
+    .alili-api-btn.primary{background:#8ab4f8;border-color:#8ab4f8;color:#0b1620;font-weight:600}
+    .alili-api-btn.primary:hover{background:#9cc2fa;border-color:#9cc2fa}
     .alili-api-btn.spin{animation:alili-api-spin 1s linear infinite}
-    .alili-api-hint{margin-left:8px;color:${COLOR_MUTED};font-size:12px;align-self:center;white-space:nowrap}
-    .alili-api-menu{display:none;position:absolute;left:0;right:0;top:34px;z-index:5;max-height:240px;overflow:auto;background:#1d2b36;border:1px solid #3a4d5b;border-radius:5px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+    .alili-api-hint{margin-left:8px;color:${COLOR_MUTED};font-size:13px;align-self:center;white-space:nowrap}
+    .alili-api-menu{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:5;max-height:240px;overflow:auto;padding:4px;background:#1e1f22;border:1px solid rgba(255,255,255,.12);border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.55)}
     .alili-api-menu.open{display:block}
-    .alili-api-item{padding:6px 9px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .alili-api-item:hover,.alili-api-item.selected{background:#274252}
-    .alili-api-foot{display:flex;align-items:center;gap:8px;margin-top:16px}
-    .alili-api-status{flex:1;min-height:34px;display:flex;align-items:center;font-size:12px;line-height:1.35;word-break:break-all}
+    .alili-api-item{padding:8px 10px;border-radius:5px;font-size:15px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .alili-api-item:hover{background:#33363b}
+    .alili-api-item.selected{background:#8ab4f8;color:#0b1620;font-weight:600}
+    .alili-api-sel{position:relative;flex:1;min-width:0}
+    .alili-api-sel select{position:absolute;inset:0;width:100%;height:100%;opacity:0;pointer-events:none}
+    .alili-api-sel-display{position:relative;display:flex;align-items:center;box-sizing:border-box;height:42px;padding:0 30px 0 12px;border-radius:7px;border:1px solid rgba(255,255,255,.12);background:#2a2c30;color:#e3e3e3;font:15px Arial,sans-serif;cursor:pointer}
+    .alili-api-sel-display:hover{border-color:rgba(255,255,255,.24)}
+    .alili-api-sel-display.open{border-color:#8ab4f8}
+    .alili-api-sel-display span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .alili-api-sel-display::after{content:"";position:absolute;right:15px;top:50%;width:5px;height:5px;margin-top:-4px;border-right:1px solid #9aa0a6;border-bottom:1px solid #9aa0a6;transform:rotate(45deg)}
+    .alili-api-sel-display.open::after{transform:rotate(-135deg);margin-top:-2px}
+    .alili-api-sel-panel{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:6;box-sizing:border-box;padding:4px;max-height:240px;overflow:auto;background:#1e1f22;border:1px solid rgba(255,255,255,.12);border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.55)}
+    .alili-api-sel-item{padding:8px 10px;border-radius:5px;font-size:15px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .alili-api-sel-item:hover{background:#33363b}
+    .alili-api-sel-item.active{background:#8ab4f8;color:#0b1620;font-weight:600}
+    .alili-api-status{margin-top:2px;font-size:13px;line-height:1.5;color:${COLOR_MUTED};word-break:break-all}
+    .alili-api-status:empty{display:none}
+    .alili-api-foot{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:18px}
     @keyframes alili-api-spin{to{transform:rotate(360deg)}}
     `;
     document.head.append(style);
@@ -283,6 +300,59 @@ function el(tag, className, text) {
     if (className) node.className = className;
     if (text != null) node.textContent = text;
     return node;
+}
+
+// 原生 select 的弹层是浏览器自己画的（尖角 + 系统配色），CSS 改不到：
+// 包成自绘，select 只留 value 和 change，显示层 / 列表都用 DOM。
+function enhanceSelect(select) {
+    const host = select.parentElement;
+    const wrap = el("div", "alili-api-sel");
+    host.insertBefore(wrap, select);
+    wrap.appendChild(select);
+    Object.assign(select.style, { position: "absolute", inset: "0", width: "100%", height: "100%", opacity: "0", pointerEvents: "none" });
+    const disp = el("div", "alili-api-sel-display");
+    const label = el("span", "");
+    disp.appendChild(label);
+    const panel = el("div", "alili-api-sel-panel");
+    panel.style.display = "none";
+    let onDoc = null;
+    const sync = () => {
+        const opt = select.selectedOptions[0];
+        label.textContent = opt ? opt.textContent : "";
+    };
+    const close = () => {
+        panel.style.display = "none";
+        disp.classList.remove("open");
+        if (onDoc) { document.removeEventListener("pointerdown", onDoc, true); onDoc = null; }
+    };
+    const build = () => {
+        panel.replaceChildren();
+        [...select.options].forEach(opt => {
+            const item = el("div", "alili-api-sel-item" + (opt.value === select.value ? " active" : ""), opt.textContent);
+            item.onclick = ev => {
+                ev.stopPropagation();
+                if (select.value !== opt.value) {
+                    select.value = opt.value;
+                    select.dispatchEvent(new Event("change"));
+                }
+                close();
+                sync();
+            };
+            panel.appendChild(item);
+        });
+    };
+    disp.onclick = ev => {
+        ev.stopPropagation();
+        if (panel.style.display === "block") { close(); return; }
+        build();
+        panel.style.display = "block";
+        disp.classList.add("open");
+        onDoc = e => { if (!wrap.contains(e.target)) close(); };
+        document.addEventListener("pointerdown", onDoc, true);
+    };
+    wrap.append(disp, panel);
+    sync();
+    return { sync, close };
 }
 
 function row(label, ...children) {
@@ -313,6 +383,7 @@ export async function openApiSettings({ onSaved } = {}) {
     overlay.append(dialog);
 
     const close = el("button", "alili-api-btn", "✕");
+    close.style.cssText = "height:34px;min-width:34px;padding:0;font-size:16px";
     const head = el("div", "alili-api-head");
     head.append(el("span", "", "⚙"), el("span", "grow", "API 设置"), close);
 
@@ -346,13 +417,14 @@ export async function openApiSettings({ onSaved } = {}) {
     const btnSave = el("button", "alili-api-btn primary", "保存");
 
     const rowPlatform = row("厂家", platform);
+    const platPicker = enhanceSelect(platform);
     const rowUrl = row("接口地址", url);
     const rowKey = row("API Key", key, eye);
     const rowModel = row("模型", model, dropBtn, refresh, menu);
     const rowTokens = row("最大 Token", tokens, el("span", "alili-api-hint", "单次回复上限，如 4096"));
     const foot = el("div", "alili-api-foot");
-    foot.append(status, btnCancel, btnSave);
-    dialog.append(head, rowPlatform.wrap, rowUrl.wrap, rowKey.wrap, rowModel.wrap, rowTokens.wrap, foot);
+    foot.append(btnCancel, btnSave);
+    dialog.append(head, rowPlatform.wrap, rowUrl.wrap, rowKey.wrap, rowModel.wrap, rowTokens.wrap, status, foot);
 
     const setStatus = (text, color) => {
         status.style.color = color || COLOR_MUTED;
@@ -395,6 +467,7 @@ export async function openApiSettings({ onSaved } = {}) {
         model.value = p.model;
         fillMenu(modelCache[pid] || []);
         menu.classList.remove("open");
+        platPicker.sync();
         setStatus("");
     };
 

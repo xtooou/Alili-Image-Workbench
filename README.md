@@ -177,12 +177,17 @@ Alili-Image-Workbench/
 │   ├── Alili_text_encode.py             # Alili 文本编码（节点本体）
 │   └── Save_image.py                    # Alili 保存图像
 ├── image_workbench/
+│   ├── assets.py                        # 素材库：存储层 + 全部 HTTP 路由（入库 / 浏览 / 缩略图 / 配置）
 │   ├── core.py                          # 分辨率计算、倍数取整
 │   ├── encoders.py                      # 官方编码器适配层（4 个分区，直接调用官方 execute）
-│   ├── prompt_optimizer.py              # 提示词优化后端（t2i/i2i 规则 + 模板库）
+│   ├── prompt_optimizer.py              # 提示词后端（API 改写 / 成品提示词 / 提示词库路由）
+│   ├── shop_presets.py                  # 造型组合预设（换形象按槽位命中，读 prompt/look_prompt）
 │   └── file_clipboard.py                # 右键复制本地文件（Win32 CF_HDROP + 路径文本）
 ├── api/api.py                           # 大模型 API 客户端（10+ 平台）
-├── templates/                           # 提示词模板库（增改自动刷新）
+├── prompt/                              # 提示词库（增改自动刷新）
+│   ├── api_prompt/                      # 给大模型的改写指令（走 API）
+│   ├── fixed_prompt/                    # 成品提示词（不走 API，直接送文本编码）
+│   └── look_prompt/                     # 造型组合（图1 底图 + 服装/姿势/发型，换形象用）
 └── web/                                 # 4 个节点，一个节点一个 js
     ├── alili_load_image.js              # 加载图像面板
     ├── alili_image_workbench.js         # 工作台面板 + 分镜入队拦截
@@ -222,7 +227,7 @@ Alili-Image-Workbench/
 > Linux / macOS 会降级为 `text/uri-list`（需要 `xclip` 或 `wl-copy`）。
 
 **Q：模板库怎么加自己的模板？**
-> 在 `templates/t2i/` 或 `templates/i2i/` 里新建 `.md` 文件，前端下拉会自动出现，无需重启。
+> 在 `prompt/fixed_prompt/`（成品提示词，「生图」下拉，直接送文本编码、不走 API）、`prompt/api_prompt/`（给大模型的改写指令，「编辑」下拉）、`prompt/look_prompt/`（换形象按槽位命中的组合成品）里新建 `.md` 文件，前端下拉会自动出现，无需重启。
 
 ---
 
