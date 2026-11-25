@@ -10,6 +10,7 @@ from .image_workbench import prompt_optimizer  # noqa: F401 (导入即注册提�
 from .image_workbench import file_clipboard  # noqa: F401 (导入即注册「复制本地文件到剪贴板」路由)
 from .image_workbench import assets  # noqa: F401 (导入即注册素材库全部路由：入库 / 浏览 / 缩略图 / 配置)
 from .image_workbench import shop_presets  # noqa: F401 (导入即注册「改造预设」列表与 AI 槽位判定路由)
+from .image_workbench import monitor  # noqa: F401 (导入即注册「Alili 资源监控」路由与采样线程)
 
 NODE_CLASS_MAPPINGS = {
     "AliliLoadImage": AliliLoadImage,
